@@ -72,7 +72,7 @@ class Channel(AbstractChannel):
         spec.method(spec.Queue.DeclareOk, 'sll'),
         spec.method(spec.Queue.DeleteOk, 'l'),
         spec.method(spec.Queue.PurgeOk, 'l'),
-        spec.method(spec.Basic.Cancel, 's'),
+        spec.method(spec.Basic.Cancel, 'sb'),
         spec.method(spec.Basic.CancelOk, 's'),
         spec.method(spec.Basic.ConsumeOk, 's'),
         spec.method(spec.Basic.Deliver, 'sLbss', content=True),
@@ -110,6 +110,7 @@ class Channel(AbstractChannel):
         self.returned_messages = Queue()
         self.callbacks = {}
         self.cancel_callbacks = {}
+        self._on_cancel_callbacks = []
         self.auto_decode = auto_decode
         self.events = defaultdict(set)
         self.no_ack_consumers = set()
@@ -128,6 +129,7 @@ class Channel(AbstractChannel):
         "returned_messages",
         "callbacks",
         "cancel_callbacks",
+        "_on_cancel_callbacks",
         "events",
         "no_ack_consumers",
         "on_open",
@@ -167,10 +169,20 @@ class Channel(AbstractChannel):
             except ValueError:
                 # channel id already removed
                 pass
+        # Consumers are gone with the channel: run any cancel callbacks
+        # that were never triggered, in deterministic (consumer tag)
+        # order, so applications can reliably re-subscribe.
+        cancel_callbacks, self.cancel_callbacks = self.cancel_callbacks, {}
+        for consumer_tag in sorted(cancel_callbacks, key=str):
+            try:
+                cancel_callbacks[consumer_tag](consumer_tag)
+            except Exception:
+                AMQP_LOGGER.exception(
+                    'Error in cancel callback for consumer %r', consumer_tag)
         self.callbacks.clear()
-        self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self._on_cancel_callbacks.clear()
 
     def _do_revive(self):
         self.is_open = False
@@ -1454,13 +1466,15 @@ class Channel(AbstractChannel):
                 wait=None if nowait else spec.Basic.CancelOk,
             )
 
-    def _on_basic_cancel(self, consumer_tag):
+    def _on_basic_cancel(self, consumer_tag, no_wait=False):
         """Consumer cancelled by server.
 
         Most likely the queue was deleted.
 
         """
         callback = self._remove_tag(consumer_tag)
+        for on_cancel in self._on_cancel_callbacks:
+            on_cancel(consumer_tag, no_wait)
         if callback:
             callback(consumer_tag)
         else:
@@ -1472,6 +1486,23 @@ class Channel(AbstractChannel):
     def _remove_tag(self, consumer_tag):
         self.callbacks.pop(consumer_tag, None)
         return self.cancel_callbacks.pop(consumer_tag, None)
+
+    def add_on_cancel_callback(self, callback):
+        """Register a callback for broker-initiated consumer cancellations.
+
+        The callback is invoked with the consumer tag and the
+        ``no_wait`` flag of every ``basic.cancel`` sent by the broker
+        for a consumer on this channel (e.g. when the queue the
+        consumer was bound to has been deleted).
+        """
+        self._on_cancel_callbacks.append(callback)
+
+    def remove_on_cancel_callback(self, callback):
+        """Remove a callback added with :meth:`add_on_cancel_callback`."""
+        try:
+            self._on_cancel_callbacks.remove(callback)
+        except ValueError:
+            pass
 
     def basic_consume(self, queue='', consumer_tag='', no_local=False,
                       no_ack=False, exclusive=False, nowait=False,
@@ -1782,6 +1813,14 @@ class Channel(AbstractChannel):
         if not self.connection:
             raise RecoverableConnectionError(
                 'basic_publish: connection closed')
+
+        # ``is True`` keeps this from triggering on mock connections,
+        # whose is_blocked() returns a truthy object.
+        if self.connection.is_blocked() is True:
+            return self.connection._enqueue_blocked_publish(
+                self, msg, exchange=exchange, routing_key=routing_key,
+                mandatory=mandatory, immediate=immediate, timeout=timeout,
+                confirm_timeout=confirm_timeout, argsig=argsig)
 
         capabilities = self.connection. \
             client_properties.get('capabilities', {})

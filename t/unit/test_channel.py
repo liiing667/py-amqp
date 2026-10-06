@@ -275,6 +275,58 @@ class test_Channel:
         assert 123 not in self.c.callbacks
         assert 123 not in self.c.cancel_callbacks
 
+    def test_add_on_cancel_callback(self):
+        on_cancel = Mock(name='on_cancel')
+        self.c.add_on_cancel_callback(on_cancel)
+        callback = self.c.callbacks['ctag1'] = Mock(name='callback')
+        cancel_cb = self.c.cancel_callbacks['ctag1'] = Mock(name='cancel_cb')
+        self.c._on_basic_cancel('ctag1', True)
+        on_cancel.assert_called_once_with('ctag1', True)
+        cancel_cb.assert_called_once_with('ctag1')
+        assert 'ctag1' not in self.c.callbacks
+        assert 'ctag1' not in self.c.cancel_callbacks
+        callback.assert_not_called()
+
+    def test_remove_on_cancel_callback(self):
+        on_cancel = Mock(name='on_cancel')
+        self.c.add_on_cancel_callback(on_cancel)
+        self.c.remove_on_cancel_callback(on_cancel)
+        # removing twice must not raise
+        self.c.remove_on_cancel_callback(on_cancel)
+        self.c.cancel_callbacks['ctag1'] = Mock(name='cancel_cb')
+        self.c._on_basic_cancel('ctag1')
+        on_cancel.assert_not_called()
+
+    def test_on_basic_cancel__dispatch(self):
+        # broker-sent basic.cancel carries consumer_tag and no_wait
+        on_cancel = Mock(name='on_cancel')
+        self.c.add_on_cancel_callback(on_cancel)
+        self.c.cancel_callbacks['ctag1'] = Mock(name='cancel_cb')
+        payload = pack('>HH', *spec.Basic.Cancel) + dumps(
+            'sb', ('ctag1', True))
+        self.c.dispatch_method(spec.Basic.Cancel, payload, None)
+        on_cancel.assert_called_once_with('ctag1', True)
+
+    def test_on_basic_cancel__stops_deliveries(self):
+        callback = Mock(name='callback')
+        self.c.callbacks['ctag1'] = callback
+        self.c.cancel_callbacks['ctag1'] = Mock(name='cancel_cb')
+        self.c._on_basic_cancel('ctag1')
+        self.c.basic_reject = Mock(name='basic_reject')
+        msg = Message(body='hello')
+        self.c._on_basic_deliver('ctag1', 1, False, 'ex', 'rkey', msg)
+        callback.assert_not_called()
+        self.c.basic_reject.assert_called_once_with(1, requeue=True)
+
+    def test_collect__cancel_callbacks_deterministic_order(self):
+        calls = []
+        for tag in ('ctag-c', 'ctag-a', 'ctag-b'):
+            self.c.cancel_callbacks[tag] = (
+                lambda consumer_tag: calls.append(consumer_tag))
+        self.c.collect()
+        assert calls == ['ctag-a', 'ctag-b', 'ctag-c']
+        assert not self.c.cancel_callbacks
+
     def test_basic_consume(self):
         callback = Mock()
         on_cancel = Mock()
@@ -539,6 +591,15 @@ class test_Channel:
         with pytest.raises(RecoverableConnectionError) as excinfo:
             self.c._basic_publish('msg', 'ex', 'rkey')
         assert 'basic_publish: connection closed' in str(excinfo.value)
+        self.c.send_method.assert_not_called()
+
+    def test_basic_publish__connection_blocked_enqueues(self):
+        self.conn.is_blocked.return_value = True
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn._enqueue_blocked_publish.assert_called_once_with(
+            self.c, 'msg', exchange='ex', routing_key='rkey',
+            mandatory=False, immediate=False, timeout=None,
+            confirm_timeout=None, argsig='Bssbb')
         self.c.send_method.assert_not_called()
 
     def test_basic_qos(self):

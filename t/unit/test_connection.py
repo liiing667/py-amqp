@@ -1,16 +1,19 @@
 import re
 import socket
 import warnings
+from struct import pack
 from unittest.mock import Mock, call, patch
 
 import pytest
 import time
 
 from amqp import Connection, spec
+from amqp.channel import Channel
 from amqp.connection import SSLError
-from amqp.exceptions import (ConnectionError, NotFound,
+from amqp.exceptions import (Blocked, ConnectionError, NotFound,
                              RecoverableConnectionError, ResourceError)
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
+from amqp.serialization import dumps
 from amqp.transport import TCPTransport
 
 from t.mocks import ContextMock
@@ -493,6 +496,77 @@ class test_Connection:
         self.conn._on_unblocked()
         self.conn.on_unblocked.assert_called_with()
 
+    def test_blocked_property(self):
+        assert self.conn.blocked is False
+        assert not self.conn.is_blocked()
+        self.conn._on_blocked('low on memory')
+        assert self.conn.blocked is True
+        assert self.conn.is_blocked()
+        assert self.conn._blocked_reason == 'low on memory'
+        self.conn._on_unblocked()
+        assert self.conn.blocked is False
+        assert not self.conn.is_blocked()
+        assert self.conn._blocked_reason is None
+
+    def test_on_blocked__reason_from_broker(self):
+        self.conn.on_blocked = Mock(name='on_blocked')
+        payload = pack('>HH', *spec.Connection.Blocked) + dumps(
+            's', ('memory alarm',))
+        self.conn.dispatch_method(spec.Connection.Blocked, payload, None)
+        self.conn.on_blocked.assert_called_once_with('memory alarm')
+        assert self.conn.is_blocked()
+
+    def test_blocked__reentrant(self):
+        # blocked -> unblocked -> blocked on the same connection
+        # must not lose the registered callbacks
+        on_blocked = self.conn.on_blocked = Mock(name='on_blocked')
+        on_unblocked = self.conn.on_unblocked = Mock(name='on_unblocked')
+        self.conn._on_blocked()
+        self.conn._on_unblocked()
+        self.conn._on_blocked()
+        assert on_blocked.call_count == 2
+        on_unblocked.assert_called_once_with()
+        assert self.conn.is_blocked()
+
+    def test_blocked_publish__queued_and_flushed_on_unblock(self):
+        channel = Mock(name='channel')
+        self.conn._on_blocked()
+        self.conn._enqueue_blocked_publish(
+            channel, 'msg', exchange='ex', routing_key='rkey')
+        assert len(self.conn._blocked_publish_queue) == 1
+        channel._basic_publish.assert_not_called()
+        self.conn._on_unblocked()
+        channel._basic_publish.assert_called_once_with(
+            'msg', exchange='ex', routing_key='rkey')
+        assert not self.conn._blocked_publish_queue
+
+    def test_blocked_publish__raise_on_blocked(self):
+        self.conn.raise_on_blocked = True
+        self.conn._on_blocked()
+        with pytest.raises(Blocked):
+            self.conn._enqueue_blocked_publish(Mock(name='channel'), 'msg')
+        assert not self.conn._blocked_publish_queue
+
+    def test_blocked_publish__flush_after_unblock(self):
+        self.conn.transport.having_timeout = ContextMock()
+        channel = Channel(self.conn, 1)
+        channel.send_method = Mock(name='send_method')
+        self.conn._on_blocked()
+        channel._basic_publish('msg', 'ex', 'rkey')
+        channel.send_method.assert_not_called()
+        self.conn._on_unblocked()
+        channel.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_collect__clears_blocked_state(self):
+        self.conn._on_blocked()
+        self.conn._enqueue_blocked_publish(Mock(name='channel'), 'msg')
+        self.conn.collect()
+        assert self.conn.blocked is False
+        assert not self.conn._blocked_publish_queue
+
     def test_send_heartbeat(self):
         self.conn.send_heartbeat()
         self.conn.frame_writer.assert_called_with(
@@ -502,6 +576,14 @@ class test_Connection:
     def test_heartbeat_tick__no_heartbeat(self):
         self.conn.heartbeat = 0
         self.conn.heartbeat_tick()
+
+    def test_heartbeat_tick__disabled_skips_bookkeeping(self):
+        # heartbeat=0 fully disables the heartbeat machinery
+        self.conn.heartbeat = 0
+        self.conn.heartbeat_tick()
+        self.conn.frame_writer.assert_not_called()
+        assert self.conn.prev_sent is None
+        assert self.conn.prev_recv is None
 
     def test_heartbeat_tick(self):
         self.conn.heartbeat = 3
@@ -513,6 +595,24 @@ class test_Connection:
         self.conn.last_heartbeat_sent -= 1000
         with pytest.raises(ConnectionError):
             self.conn.heartbeat_tick()
+
+    def test_heartbeat_tick__compensates_missed(self):
+        # A long gap between two heartbeat_tick() calls must be
+        # compensated with catch-up sends instead of silently
+        # dropping the missed heartbeats.
+        self.conn.heartbeat = 2
+        self.conn.heartbeat_tick()
+        self.conn.last_heartbeat_sent -= 10
+        self.conn.heartbeat_tick()
+        # interval is heartbeat/rate = 1s; 10 sends were missed, but
+        # compensation is capped at two intervals' worth (2 * rate).
+        assert self.conn.frame_writer.call_count == 4
+
+    def test_heartbeat_tick__no_compensation_after_short_gap(self):
+        self.conn.heartbeat = 60
+        self.conn.heartbeat_tick()
+        self.conn.heartbeat_tick()
+        self.conn.frame_writer.assert_not_called()
 
     def _test_heartbeat_rate_tick(self, rate):
         # Doing 22 calls,

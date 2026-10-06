@@ -6,6 +6,8 @@ import socket
 import uuid
 import warnings
 from array import array
+from collections import deque
+from functools import partial
 from time import monotonic
 
 from vine import ensure_promise
@@ -13,10 +15,10 @@ from vine import ensure_promise
 from . import __version__, sasl, spec
 from .abstract_channel import AbstractChannel
 from .channel import Channel
-from .exceptions import (AMQPDeprecationWarning, ChannelError, ConnectionError,
-                         ConnectionForced, MessageNacked, RecoverableChannelError,
-                         RecoverableConnectionError, ResourceError,
-                         error_for_code)
+from .exceptions import (AMQPDeprecationWarning, Blocked, ChannelError,
+                         ConnectionError, ConnectionForced, MessageNacked,
+                         RecoverableChannelError, RecoverableConnectionError,
+                         ResourceError, error_for_code)
 from .method_framing import frame_handler, frame_writer
 from .transport import Transport
 
@@ -160,7 +162,7 @@ class Connection(AbstractChannel):
         spec.method(spec.Connection.Secure, 's'),
         spec.method(spec.Connection.Tune, 'BlB'),
         spec.method(spec.Connection.Close, 'BsBB'),
-        spec.method(spec.Connection.Blocked),
+        spec.method(spec.Connection.Blocked, 's'),
         spec.method(spec.Connection.Unblocked),
         spec.method(spec.Connection.CloseOk),
     }
@@ -194,7 +196,8 @@ class Connection(AbstractChannel):
                  virtual_host='/', locale='en_US', client_properties=None,
                  ssl=False, connect_timeout=None, channel_max=None,
                  frame_max=None, heartbeat=0, on_open=None, on_blocked=None,
-                 on_unblocked=None, confirm_publish=False,
+                 on_unblocked=None, raise_on_blocked=False,
+                 confirm_publish=False,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
                  frame_writer=frame_writer, **kwargs):
@@ -267,6 +270,12 @@ class Connection(AbstractChannel):
         self.on_blocked = on_blocked
         self.on_unblocked = on_unblocked
         self.on_open = ensure_promise(on_open)
+
+        # State set by broker-sent Connection.Blocked/Unblocked.
+        self.raise_on_blocked = raise_on_blocked
+        self._blocked = False
+        self._blocked_reason = None
+        self._blocked_publish_queue = deque()
 
         self._used_channel_ids = array('H')
 
@@ -466,15 +475,39 @@ class Connection(AbstractChannel):
     def connected(self):
         return self._transport and self._transport.connected
 
+    @property
+    def blocked(self):
+        """Whether the connection is currently blocked by the broker.
+
+        The broker blocks a connection when it is low on resources
+        (e.g. a memory or disk alarm) and unblocks it once it can
+        accept publishes again.
+        """
+        return self._blocked
+
+    def is_blocked(self):
+        """Return ``True`` while the connection is blocked by the broker."""
+        return self._blocked
+
     def collect(self):
         if self._transport:
             self._transport.close()
 
+        self._blocked = False
+        self._blocked_reason = None
+        if self._blocked_publish_queue:
+            AMQP_LOGGER.debug(
+                'Discarding %d message(s) queued while the connection '
+                'was blocked', len(self._blocked_publish_queue),
+            )
+            self._blocked_publish_queue.clear()
+
         if self.channels:
             # Copy all the channels except self since the channels
             # dictionary changes during the collection process.
+            # Iterate by channel id so the teardown order is deterministic.
             channels = [
-                ch for ch in self.channels.values()
+                ch for _, ch in sorted(self.channels.items())
                 if ch is not self
             ]
 
@@ -695,19 +728,44 @@ class Connection(AbstractChannel):
         """
         self.collect()
 
-    def _on_blocked(self):
+    def _on_blocked(self, reason=''):
         """Callback called when connection blocked.
 
         Notes:
             This is an RabbitMQ Extension.
         """
-        reason = 'connection blocked, see broker logs'
+        self._blocked = True
+        self._blocked_reason = reason or 'connection blocked, see broker logs'
         if self.on_blocked:
-            return self.on_blocked(reason)
+            return self.on_blocked(self._blocked_reason)
 
     def _on_unblocked(self):
-        if self.on_unblocked:
-            return self.on_unblocked()
+        self._blocked = False
+        self._blocked_reason = None
+        try:
+            if self.on_unblocked:
+                return self.on_unblocked()
+        finally:
+            self._flush_blocked_publishes()
+
+    def _enqueue_blocked_publish(self, channel, *args, **kwargs):
+        """Handle a ``basic_publish`` issued while the connection is blocked.
+
+        The publish is queued and sent again once the connection is
+        unblocked, unless :attr:`raise_on_blocked` is set, in which
+        case a :class:`~amqp.exceptions.Blocked` error is raised.
+        """
+        if self.raise_on_blocked:
+            raise Blocked(
+                'Connection blocked by broker, cannot publish message')
+        self._blocked_publish_queue.append(
+            partial(channel._basic_publish, *args, **kwargs))
+
+    def _flush_blocked_publishes(self):
+        """Send publishes queued while the connection was blocked."""
+        while self._blocked_publish_queue and not self._blocked:
+            publish = self._blocked_publish_queue.popleft()
+            publish()
 
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)
@@ -730,21 +788,25 @@ class Connection(AbstractChannel):
         AMQP_HEARTBEAT_LOGGER.debug('heartbeat_tick : for connection %s',
                                     self._connection_id)
         if not self.heartbeat:
+            # Heartbeats are disabled: skip all of the bookkeeping below.
             return
 
         # If rate is wrong, let's use 2 as default
         if rate <= 0:
             rate = 2
 
+        # Single monotonic clock reading used for every check below,
+        # so send/receive decisions cannot disagree with each other.
+        now = monotonic()
+
         # treat actual data exchange in either direction as a heartbeat
         sent_now = self.bytes_sent
         recv_now = self.bytes_recv
         if self.prev_sent is None or self.prev_sent != sent_now:
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = now
         if self.prev_recv is None or self.prev_recv != recv_now:
-            self.last_heartbeat_received = monotonic()
+            self.last_heartbeat_received = now
 
-        now = monotonic()
         AMQP_HEARTBEAT_LOGGER.debug(
             'heartbeat_tick : Prev sent/recv: %s/%s, '
             'now - %s/%s, monotonic - %s, '
@@ -759,19 +821,27 @@ class Connection(AbstractChannel):
 
         self.prev_sent, self.prev_recv = sent_now, recv_now
 
-        # send a heartbeat if it's time to do so
-        if now > self.last_heartbeat_sent + self.heartbeat / rate:
+        # send a heartbeat if it's time to do so; if this method was not
+        # called for a while, compensate by sending the heartbeats that
+        # were missed in the meantime (capped at two intervals' worth,
+        # since older ones cannot affect the broker's timeout anyway).
+        send_interval = self.heartbeat / rate
+        if now > self.last_heartbeat_sent + send_interval:
+            missed = int(
+                (now - self.last_heartbeat_sent) // send_interval)
+            missed = min(missed, 2 * rate)
             AMQP_HEARTBEAT_LOGGER.debug(
-                'heartbeat_tick: sending heartbeat for connection %s',
-                self._connection_id)
-            self.send_heartbeat()
+                'heartbeat_tick: sending %s heartbeat(s) for connection %s',
+                missed, self._connection_id)
+            for _ in range(missed):
+                self.send_heartbeat()
             self.last_heartbeat_sent = monotonic()
 
         # if we've missed two intervals' heartbeats, fail; this gives the
         # server enough time to send heartbeats a little late
         two_heartbeats = 2 * self.heartbeat
         two_heartbeats_interval = self.last_heartbeat_received + two_heartbeats
-        heartbeats_missed = two_heartbeats_interval < monotonic()
+        heartbeats_missed = two_heartbeats_interval < now
         if self.last_heartbeat_received and heartbeats_missed:
             raise ConnectionForced('Too many heartbeats missed')
 
