@@ -1,6 +1,6 @@
 import socket
 from struct import pack
-from unittest.mock import ANY, MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import pytest
 from vine import promise
@@ -8,8 +8,8 @@ from vine import promise
 from amqp import spec
 from amqp.basic_message import Message
 from amqp.channel import Channel
-from amqp.exceptions import (ConsumerCancelled, MessageNacked, NotFound,
-                             RecoverableConnectionError)
+from amqp.exceptions import (Blocked, ConsumerCancelled, MessageNacked,
+                             NotFound, RecoverableConnectionError)
 from amqp.serialization import dumps
 
 from t.mocks import ContextMock
@@ -275,6 +275,65 @@ class test_Channel:
         assert 123 not in self.c.callbacks
         assert 123 not in self.c.cancel_callbacks
 
+    def test_add_on_cancel_callback(self):
+        on_cancel = Mock(name='on_cancel')
+        per_consumer = self.c.cancel_callbacks['tag'] = Mock()
+        self.c.callbacks['tag'] = Mock()
+        self.c.add_on_cancel_callback(on_cancel)
+
+        self.c._on_basic_cancel('tag', True)
+
+        on_cancel.assert_called_once_with('tag', True)
+        per_consumer.assert_called_once_with('tag')
+        assert 'tag' not in self.c.callbacks
+        assert 'tag' not in self.c.cancel_callbacks
+
+    def test_add_on_cancel_callback_default_nowait(self):
+        on_cancel = Mock(name='on_cancel')
+        self.c.add_on_cancel_callback(on_cancel)
+        with pytest.raises(ConsumerCancelled):
+            self.c._on_basic_cancel('tag')
+        on_cancel.assert_called_once_with('tag', False)
+
+    def test_remove_on_cancel_callback(self):
+        on_cancel = Mock(name='on_cancel')
+        self.c.add_on_cancel_callback(on_cancel)
+        self.c.remove_on_cancel_callback(on_cancel)
+        assert not self.c._on_cancel_callbacks
+
+    def test_on_basic_cancel_stops_delivery(self):
+        deliver = Mock(name='deliver')
+        self.c.callbacks['tag'] = deliver
+        self.c.cancel_callbacks['tag'] = Mock()
+        with patch.object(self.c, 'basic_reject') as basic_reject:
+            self.c._on_basic_cancel('tag')
+            self.c._on_basic_deliver(
+                'tag', 1, False, 'ex', 'rkey', MagicMock(),
+            )
+        deliver.assert_not_called()
+        basic_reject.assert_called_once_with(1, requeue=True)
+
+    def test_collect_triggers_cancel_callbacks_in_order(self):
+        parent = Mock()
+        self.c.cancel_callbacks['b'] = parent.cb_b
+        self.c.cancel_callbacks['a'] = parent.cb_a
+
+        self.c.collect()
+
+        assert parent.mock_calls == [call.cb_a('a'), call.cb_b('b')]
+        assert not self.c.cancel_callbacks
+
+    def test_collect_cancel_callback_exception_is_swallowed(self):
+        bad = Mock(side_effect=ValueError)
+        good = Mock()
+        self.c.cancel_callbacks['a'] = bad
+        self.c.cancel_callbacks['b'] = good
+
+        self.c.collect()
+
+        good.assert_called_once_with('b')
+        assert not self.c.cancel_callbacks
+
     def test_basic_consume(self):
         callback = Mock()
         on_cancel = Mock()
@@ -511,6 +570,26 @@ class test_Channel:
             spec.Basic.Publish, 'Bssbb',
             (0, 'ex', 'rkey', False, False), 'msg',
         )
+
+    def test_basic_publish_while_blocked_queues(self):
+        # When the connection is blocked by the broker, the publish
+        # is queued on the connection instead of being sent.
+        self.conn.is_blocked.return_value = True
+        self.conn.blocked_raises = False
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.c.send_method.assert_not_called()
+        self.conn._queue_blocked_publish.assert_called_once_with(
+            self.c, 'msg', 'ex', 'rkey', False, False, None,
+        )
+
+    def test_basic_publish_while_blocked_raises(self):
+        # When blocked_raises is enabled, publishing while blocked
+        # raises a Blocked error instead of queueing.
+        self.conn.is_blocked.return_value = True
+        self.conn.blocked_raises = True
+        with pytest.raises(Blocked):
+            self.c._basic_publish('msg', 'ex', 'rkey')
+        self.c.send_method.assert_not_called()
 
     def test_basic_publish_confirm_callback(self):
 

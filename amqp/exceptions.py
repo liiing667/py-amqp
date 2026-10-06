@@ -12,7 +12,7 @@ __all__ = (
     'ConnectionForced', 'InvalidPath', 'AccessRefused', 'NotFound',
     'ResourceLocked', 'PreconditionFailed', 'FrameError', 'FrameSyntaxError',
     'InvalidCommand', 'ChannelNotOpen', 'UnexpectedFrame', 'ResourceError',
-    'NotAllowed', 'AMQPNotImplementedError', 'InternalError',
+    'NotAllowed', 'AMQPNotImplementedError', 'InternalError', 'Blocked',
     'MessageNacked',
     'AMQPDeprecationWarning',
 )

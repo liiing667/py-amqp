@@ -493,6 +493,63 @@ class test_Connection:
         self.conn._on_unblocked()
         self.conn.on_unblocked.assert_called_with()
 
+    def test_blocked_state_initial(self):
+        assert self.conn.blocked is False
+        assert self.conn.is_blocked() is False
+
+    def test_on_blocked_sets_state(self):
+        self.conn._on_blocked()
+        assert self.conn.blocked is True
+        assert self.conn.is_blocked() is True
+
+    def test_on_unblocked_clears_state(self):
+        self.conn._on_blocked()
+        self.conn._on_unblocked()
+        assert self.conn.blocked is False
+        assert self.conn.is_blocked() is False
+
+    def test_blocked_state_reentrant(self):
+        self.conn.on_blocked = Mock(name='on_blocked')
+        self.conn.on_unblocked = Mock(name='on_unblocked')
+        for _ in range(2):
+            self.conn._on_blocked()
+            assert self.conn.is_blocked()
+            self.conn._on_unblocked()
+            assert not self.conn.is_blocked()
+        assert self.conn.on_blocked.call_count == 2
+        assert self.conn.on_unblocked.call_count == 2
+
+    def test_on_unblocked_flushes_queued_publishes(self):
+        channel = Mock(name='channel')
+        self.conn._queue_blocked_publish(
+            channel, 'msg', 'ex', 'rkey', False, False, None,
+        )
+        self.conn._on_blocked()
+        self.conn._on_unblocked()
+        channel._basic_publish.assert_called_once_with(
+            'msg', exchange='ex', routing_key='rkey',
+            mandatory=False, immediate=False, timeout=None,
+        )
+        assert not self.conn._blocked_publish_queue
+
+    def test_on_unblocked_skips_closed_channels(self):
+        channel = Mock(name='channel')
+        channel.connection = None
+        self.conn._queue_blocked_publish(
+            channel, 'msg', 'ex', 'rkey', False, False, None,
+        )
+        self.conn._on_unblocked()
+        channel._basic_publish.assert_not_called()
+
+    def test_collect_resets_blocked_state(self):
+        self.conn._on_blocked()
+        self.conn._queue_blocked_publish(
+            Mock(name='channel'), 'msg', 'ex', 'rkey', False, False, None,
+        )
+        self.conn.collect()
+        assert self.conn.blocked is False
+        assert not self.conn._blocked_publish_queue
+
     def test_send_heartbeat(self):
         self.conn.send_heartbeat()
         self.conn.frame_writer.assert_called_with(

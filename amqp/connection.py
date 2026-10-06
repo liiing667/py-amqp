@@ -105,6 +105,11 @@ class Connection(AbstractChannel):
     When "confirm_publish" is set to True, the channel is put to
     confirm mode. In this mode, each published message is
     confirmed using Publisher confirms RabbitMQ extension.
+
+    When "blocked_raises" is set to True, publishing a message while
+    the connection is blocked by the broker raises
+    :exc:`~amqp.exceptions.Blocked` immediately instead of queueing
+    the message until the connection is unblocked.
     """
 
     Channel = Channel
@@ -194,7 +199,7 @@ class Connection(AbstractChannel):
                  virtual_host='/', locale='en_US', client_properties=None,
                  ssl=False, connect_timeout=None, channel_max=None,
                  frame_max=None, heartbeat=0, on_open=None, on_blocked=None,
-                 on_unblocked=None, confirm_publish=False,
+                 on_unblocked=None, blocked_raises=False, confirm_publish=False,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
                  frame_writer=frame_writer, **kwargs):
@@ -267,6 +272,12 @@ class Connection(AbstractChannel):
         self.on_blocked = on_blocked
         self.on_unblocked = on_unblocked
         self.on_open = ensure_promise(on_open)
+
+        # Set when the broker sends Connection.Blocked, and cleared
+        # again when Connection.Unblocked is received.
+        self._blocked = False
+        self.blocked_raises = blocked_raises
+        self._blocked_publish_queue = []
 
         self._used_channel_ids = array('H')
 
@@ -469,6 +480,9 @@ class Connection(AbstractChannel):
     def collect(self):
         if self._transport:
             self._transport.close()
+
+        self._blocked = False
+        self._blocked_publish_queue.clear()
 
         if self.channels:
             # Copy all the channels except self since the channels
@@ -702,12 +716,55 @@ class Connection(AbstractChannel):
             This is an RabbitMQ Extension.
         """
         reason = 'connection blocked, see broker logs'
+        self._blocked = True
         if self.on_blocked:
             return self.on_blocked(reason)
 
     def _on_unblocked(self):
-        if self.on_unblocked:
-            return self.on_unblocked()
+        self._blocked = False
+        try:
+            if self.on_unblocked:
+                return self.on_unblocked()
+        finally:
+            self._flush_blocked_publishes()
+
+    @property
+    def blocked(self):
+        """Whether the connection is currently blocked by the broker."""
+        return self._blocked
+
+    def is_blocked(self):
+        """Return True if the connection is currently blocked."""
+        return self._blocked
+
+    def _queue_blocked_publish(self, channel, msg, exchange, routing_key,
+                               mandatory, immediate, timeout):
+        """Queue a publish attempted while the connection is blocked.
+
+        The publish is retried automatically once the broker unblocks
+        the connection.
+        """
+        self._blocked_publish_queue.append(
+            (channel, msg, exchange, routing_key,
+             mandatory, immediate, timeout),
+        )
+
+    def _flush_blocked_publishes(self):
+        """Publish messages queued while the connection was blocked."""
+        queue, self._blocked_publish_queue = self._blocked_publish_queue, []
+        for (channel, msg, exchange, routing_key,
+             mandatory, immediate, timeout) in queue:
+            if channel.connection is None:
+                continue
+            try:
+                channel._basic_publish(
+                    msg, exchange=exchange, routing_key=routing_key,
+                    mandatory=mandatory, immediate=immediate, timeout=timeout,
+                )
+            except Exception:
+                AMQP_LOGGER.exception(
+                    'Failed to publish message queued while connection '
+                    'was blocked')
 
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)

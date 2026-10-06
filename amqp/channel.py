@@ -10,8 +10,8 @@ from vine import ensure_promise
 
 from . import spec
 from .abstract_channel import AbstractChannel
-from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
-                         RecoverableConnectionError,
+from .exceptions import (Blocked, ChannelError, ConsumerCancelled,
+                         MessageNacked, RecoverableConnectionError,
                          error_for_code)
 from .protocol import queue_declare_ok_t
 
@@ -72,7 +72,7 @@ class Channel(AbstractChannel):
         spec.method(spec.Queue.DeclareOk, 'sll'),
         spec.method(spec.Queue.DeleteOk, 'l'),
         spec.method(spec.Queue.PurgeOk, 'l'),
-        spec.method(spec.Basic.Cancel, 's'),
+        spec.method(spec.Basic.Cancel, 'sb'),
         spec.method(spec.Basic.CancelOk, 's'),
         spec.method(spec.Basic.ConsumeOk, 's'),
         spec.method(spec.Basic.Deliver, 'sLbss', content=True),
@@ -110,6 +110,7 @@ class Channel(AbstractChannel):
         self.returned_messages = Queue()
         self.callbacks = {}
         self.cancel_callbacks = {}
+        self._on_cancel_callbacks = []
         self.auto_decode = auto_decode
         self.events = defaultdict(set)
         self.no_ack_consumers = set()
@@ -128,6 +129,7 @@ class Channel(AbstractChannel):
         "returned_messages",
         "callbacks",
         "cancel_callbacks",
+        "_on_cancel_callbacks",
         "events",
         "no_ack_consumers",
         "on_open",
@@ -158,6 +160,7 @@ class Channel(AbstractChannel):
         """
         AMQP_LOGGER.debug('Closed channel #%s', self.channel_id)
         self.is_open = False
+        self._trigger_pending_cancel_callbacks()
         channel_id, self.channel_id = self.channel_id, None
         connection, self.connection = self.connection, None
         if connection:
@@ -171,6 +174,44 @@ class Channel(AbstractChannel):
         self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self._on_cancel_callbacks.clear()
+
+    def add_on_cancel_callback(self, callback):
+        """Register a callback for broker initiated consumer cancels.
+
+        When the broker sends a ``Basic.Cancel`` method, the callback is
+        invoked with the consumer tag and the ``nowait`` flag of the
+        received method.
+        """
+        self._on_cancel_callbacks.append(callback)
+
+    def remove_on_cancel_callback(self, callback):
+        """Remove a callback registered by :meth:`add_on_cancel_callback`."""
+        self._on_cancel_callbacks.remove(callback)
+
+    def _trigger_pending_cancel_callbacks(self):
+        """Trigger consumer cancel callbacks not fired before teardown.
+
+        Callbacks are triggered in sorted consumer-tag order, so cleanup
+        always happens in a deterministic order.
+        """
+        if not self.cancel_callbacks:
+            return
+        try:
+            consumer_tags = sorted(self.cancel_callbacks)
+        except TypeError:
+            consumer_tags = list(self.cancel_callbacks)
+        for consumer_tag in consumer_tags:
+            callback = self.cancel_callbacks.pop(consumer_tag, None)
+            if callback is None:
+                continue
+            try:
+                callback(consumer_tag)
+            except Exception:
+                AMQP_LOGGER.exception(
+                    'Cancel callback for consumer %r raised while '
+                    'closing channel %s', consumer_tag, self.channel_id,
+                )
 
     def _do_revive(self):
         self.is_open = False
@@ -1454,13 +1495,15 @@ class Channel(AbstractChannel):
                 wait=None if nowait else spec.Basic.CancelOk,
             )
 
-    def _on_basic_cancel(self, consumer_tag):
+    def _on_basic_cancel(self, consumer_tag, nowait=False):
         """Consumer cancelled by server.
 
         Most likely the queue was deleted.
 
         """
         callback = self._remove_tag(consumer_tag)
+        for on_cancel_callback in self._on_cancel_callbacks:
+            on_cancel_callback(consumer_tag, nowait)
         if callback:
             callback(consumer_tag)
         else:
@@ -1791,6 +1834,19 @@ class Channel(AbstractChannel):
                 self.connection.drain_events(timeout=0)
             except socket.timeout:
                 pass
+
+        # Identity check: a mocked connection returns a truthy mock here.
+        if self.connection.is_blocked() is True:
+            if self.connection.blocked_raises is True:
+                raise Blocked(
+                    'Connection is blocked by the broker, '
+                    'basic_publish is disabled until unblocked'
+                )
+            self.connection._queue_blocked_publish(
+                self, msg, exchange, routing_key,
+                mandatory, immediate, timeout,
+            )
+            return
 
         try:
             with self.connection.transport.having_timeout(timeout):
